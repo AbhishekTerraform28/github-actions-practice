@@ -1,1 +1,20 @@
 
+name: My First GitHub Actions Workflow
+
+on: 
+  push:
+
+jobs:
+  first-job:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print welcome message
+        run: echo "Hello! My first GitHub Actions pipeline is running"
+
+      - name: Check Linux version
+        run: uname -a
+
+      - name: Check current directory
+        run: pwd
+
