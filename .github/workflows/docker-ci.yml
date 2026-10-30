@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -16,25 +15,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout source code
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # Step 2: Configure Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 3: Login to Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      # Step 4: Build and Push Docker Image
       - name: Build and Push Image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:latest
+
+  deploy:
+    name: Deploy to EC2
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy application on EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo docker pull abhishek678931/github-actions-app:latest
+            sudo docker stop myapp || true
+            sudo docker rm myapp || true
+            sudo docker run -d --name myapp -p 80:80 --restart unless-stopped abhishek678931/github-actions-app:latest
+            sudo docker ps
