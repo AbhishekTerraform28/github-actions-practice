@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Docker image SHA tag to promote"
+        description: "Docker image SHA to promote"
         required: true
         type: string
 
       target_environment:
-        description: "Environment to deploy"
+        description: "Select deployment environment"
         required: true
         type: choice
         options:
@@ -26,7 +26,9 @@ permissions:
 
 jobs:
 
-  # 1. Build image only when code is pushed to develop
+  # =====================================
+  # JOB 1: BUILD AND PUSH DOCKER IMAGE
+  # =====================================
   build:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -35,19 +37,20 @@ jobs:
       image_tag: ${{ steps.tag.outputs.image_tag }}
 
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Validate application
+      - name: Validate Application
         run: |
           test -f Dockerfile
           test -f index.html
+          echo "Application validation successful"
 
-      - name: Set image tag
+      - name: Set Image Tag
         id: tag
         run: echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Buildx
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
@@ -56,14 +59,16 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and Push Image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:${{ github.sha }}
 
-  # 2. Deploy newly built image to DEV
+  # =====================================
+  # JOB 2: DEPLOY TO DEV
+  # =====================================
   deploy-dev:
     if: github.event_name == 'push'
     needs: build
@@ -72,8 +77,9 @@ jobs:
     environment: dev
 
     steps:
-      - name: Deploy DEV
+      - name: Deploy DEV with Automatic Rollback
         uses: appleboy/ssh-action@v1.2.0
+
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:${{ needs.build.outputs.image_tag }}
           APP_PORT: ${{ vars.APP_PORT }}
@@ -84,18 +90,86 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: IMAGE,APP_PORT,CONTAINER_NAME
+
           script: |
             set -e
+
+            echo "Capturing previous image..."
+
+            PREVIOUS_IMAGE=$(sudo docker inspect \
+              --format='{{.Config.Image}}' "$CONTAINER_NAME" \
+              2>/dev/null || true)
+
+            echo "Previous image: $PREVIOUS_IMAGE"
+            echo "New image: $IMAGE"
+
+            echo "Pulling new image..."
             sudo docker pull "$IMAGE"
+
+            echo "Stopping old container..."
             sudo docker stop "$CONTAINER_NAME" || true
             sudo docker rm "$CONTAINER_NAME" || true
+
+            echo "Starting new container..."
+
             sudo docker run -d \
               --name "$CONTAINER_NAME" \
               -p "$APP_PORT:80" \
               --restart unless-stopped \
               "$IMAGE"
 
-  # 3. Promote existing image to QA or PROD
+            echo "Checking application health..."
+
+            HEALTHY=false
+
+            for i in $(seq 1 10); do
+              if curl -fsS "http://localhost:$APP_PORT/" >/dev/null; then
+                HEALTHY=true
+                break
+              fi
+
+              echo "Health check attempt $i failed"
+              sleep 3
+            done
+
+            if [ "$HEALTHY" = "true" ]; then
+              echo "Deployment successful!"
+              exit 0
+            fi
+
+            echo "Deployment failed. Starting rollback..."
+
+            sudo docker stop "$CONTAINER_NAME" || true
+            sudo docker rm "$CONTAINER_NAME" || true
+
+            if [ -n "$PREVIOUS_IMAGE" ]; then
+
+              sudo docker run -d \
+                --name "$CONTAINER_NAME" \
+                -p "$APP_PORT:80" \
+                --restart unless-stopped \
+                "$PREVIOUS_IMAGE"
+
+              echo "Previous image restored"
+
+              for i in $(seq 1 10); do
+                if curl -fsS "http://localhost:$APP_PORT/" >/dev/null; then
+                  echo "Rollback successful!"
+                  exit 1
+                fi
+                sleep 3
+              done
+
+              echo "Rollback health check failed!"
+            else
+              echo "No previous image available!"
+            fi
+
+            exit 1
+
+  # =====================================
+  # JOB 3: PROMOTE EXISTING IMAGE TO QA/PROD
+  # =====================================
   promote:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -104,12 +178,18 @@ jobs:
       name: ${{ inputs.target_environment }}
 
     steps:
-      - name: Deploy existing image
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Deploy with Automatic Rollback
         uses: appleboy/ssh-action@v1.2.0
+
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:${{ inputs.image_tag }}
           APP_PORT: ${{ vars.APP_PORT }}
-          TARGET_ENV: ${{ inputs.target_environment }}
           CONTAINER_NAME: ${{ inputs.target_environment == 'qa' && 'myapp-qa' || 'myapp-prod' }}
 
         with:
@@ -117,16 +197,66 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: IMAGE,APP_PORT,CONTAINER_NAME
+
           script: |
             set -e
+
+            echo "Capturing previous image..."
+
+            PREVIOUS_IMAGE=$(sudo docker inspect \
+              --format='{{.Config.Image}}' "$CONTAINER_NAME" \
+              2>/dev/null || true)
+
+            echo "Previous image: $PREVIOUS_IMAGE"
+
             sudo docker pull "$IMAGE"
+
             sudo docker stop "$CONTAINER_NAME" || true
             sudo docker rm "$CONTAINER_NAME" || true
+
             sudo docker run -d \
               --name "$CONTAINER_NAME" \
               -p "$APP_PORT:80" \
               --restart unless-stopped \
               "$IMAGE"
 
-            sudo docker ps
-            echo "Deployment completed"
+            echo "Checking application health..."
+
+            HEALTHY=false
+
+            for i in $(seq 1 10); do
+              if curl -fsS "http://localhost:$APP_PORT/" >/dev/null; then
+                HEALTHY=true
+                break
+              fi
+              sleep 3
+            done
+
+            if [ "$HEALTHY" = "true" ]; then
+              echo "Deployment successful!"
+              exit 0
+            fi
+
+            echo "Deployment failed. Rolling back..."
+
+            sudo docker stop "$CONTAINER_NAME" || true
+            sudo docker rm "$CONTAINER_NAME" || true
+
+            if [ -n "$PREVIOUS_IMAGE" ]; then
+              sudo docker run -d \
+                --name "$CONTAINER_NAME" \
+                -p "$APP_PORT:80" \
+                --restart unless-stopped \
+                "$PREVIOUS_IMAGE"
+
+              for i in $(seq 1 10); do
+                if curl -fsS "http://localhost:$APP_PORT/" >/dev/null; then
+                  echo "Rollback successful!"
+                  exit 1
+                fi
+                sleep 3
+              done
+            fi
+
+            echo "Deployment and rollback failed!"
+            exit 1
