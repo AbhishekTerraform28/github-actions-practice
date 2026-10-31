@@ -1,37 +1,53 @@
 
-name: Multi Environment CI CD
+name: Build Once Deploy Everywhere
 
 on:
   push:
     branches:
       - develop
-      - 'release/**'
-      - main
+
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image SHA tag to promote"
+        required: true
+        type: string
+
+      target_environment:
+        description: "Environment to deploy"
+        required: true
+        type: choice
+        options:
+          - qa
+          - production
 
 permissions:
   contents: read
 
 jobs:
 
+  # 1. Build image only when code is pushed to develop
   build:
-    name: Build and Push Docker Image
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     outputs:
-      image_tag: ${{ github.sha }}
+      image_tag: ${{ steps.tag.outputs.image_tag }}
 
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate Application
+      - name: Validate application
         run: |
           test -f Dockerfile
           test -f index.html
-          echo "Application validation successful"
 
-      - name: Setup Docker Buildx
+      - name: Set image tag
+        id: tag
+        run: echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
@@ -40,33 +56,29 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build and Push Image
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:${{ github.sha }}
 
-  deploy:
-    name: Deploy Application
+  # 2. Deploy newly built image to DEV
+  deploy-dev:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
 
-    if: |
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      github.ref == 'refs/heads/main'
-
-    environment:
-      name: ${{ github.ref == 'refs/heads/main' && 'production' || startsWith(github.ref, 'refs/heads/release/') && 'qa' || 'dev' }}
+    environment: dev
 
     steps:
-      - name: Deploy to EC2
+      - name: Deploy DEV
         uses: appleboy/ssh-action@v1.2.0
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:${{ needs.build.outputs.image_tag }}
           APP_PORT: ${{ vars.APP_PORT }}
-          CONTAINER_NAME: ${{ github.ref == 'refs/heads/main' && 'myapp-prod' || startsWith(github.ref, 'refs/heads/release/') && 'myapp-qa' || 'myapp-dev' }}
+          CONTAINER_NAME: myapp-dev
+
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
@@ -74,12 +86,42 @@ jobs:
           envs: IMAGE,APP_PORT,CONTAINER_NAME
           script: |
             set -e
-
             sudo docker pull "$IMAGE"
-
             sudo docker stop "$CONTAINER_NAME" || true
             sudo docker rm "$CONTAINER_NAME" || true
+            sudo docker run -d \
+              --name "$CONTAINER_NAME" \
+              -p "$APP_PORT:80" \
+              --restart unless-stopped \
+              "$IMAGE"
 
+  # 3. Promote existing image to QA or PROD
+  promote:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    environment:
+      name: ${{ inputs.target_environment }}
+
+    steps:
+      - name: Deploy existing image
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/github-actions-app:${{ inputs.image_tag }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          TARGET_ENV: ${{ inputs.target_environment }}
+          CONTAINER_NAME: ${{ inputs.target_environment == 'qa' && 'myapp-qa' || 'myapp-prod' }}
+
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE,APP_PORT,CONTAINER_NAME
+          script: |
+            set -e
+            sudo docker pull "$IMAGE"
+            sudo docker stop "$CONTAINER_NAME" || true
+            sudo docker rm "$CONTAINER_NAME" || true
             sudo docker run -d \
               --name "$CONTAINER_NAME" \
               -p "$APP_PORT:80" \
@@ -87,4 +129,4 @@ jobs:
               "$IMAGE"
 
             sudo docker ps
-            echo "Deployment completed successfully"
+            echo "Deployment completed"
