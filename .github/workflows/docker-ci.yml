@@ -123,7 +123,7 @@ jobs:
             HEALTHY=false
 
             for i in $(seq 1 10); do
-              if curl -fsS "http://localhost:$APP_PORT/" >/dev/null; then
+              if curl -fsS "http://localhost:$APP_PORT/" | grep -q 'THIS_TEXT_DOES_NOT_EXIST'; then
                 HEALTHY=true
                 break
               fi
